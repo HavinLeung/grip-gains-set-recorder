@@ -1,0 +1,10 @@
+; Compiles every module here (plus reason-react and the Melange runtime) to ES modules under
+; _build/default/web/src/js/. esbuild then bundles js/web/src/main.js into dist/app.js.
+
+(melange.emit
+ (target js)
+ (alias web)
+ (libraries reason-react timer_core)
+ (preprocess
+  (pps melange.ppx reason-react-ppx))
+ (module_systems es6))

@@ -1,0 +1,14 @@
+(* Entry point: the page is the Timer. Nothing is fetched but the page's own files, which the
+   service worker keeps so the app opens offline. *)
+
+let () =
+  App_prefs.apply ();
+  Browser.register_service_worker ();
+  match ReactDOM.querySelector "#root" with
+  | Some root ->
+      ReactDOM.Client.render
+        (ReactDOM.Client.createRoot root)
+        <main>
+          <h1>(React.string "Grip Gains Set Recorder")</h1> <Timer_tab />
+        </main>
+  | None -> Js.Console.error "Grip Gains Set Recorder: no #root element"

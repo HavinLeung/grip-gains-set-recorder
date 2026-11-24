@@ -1,0 +1,243 @@
+(* Pieces the Timer's panels share: number boxes that commit on blur or Enter (like the MVP's
+   "change" events), segmented controls, steppers, the set summary and the rep lists with their
+   graphs. *)
+
+open Timer_core
+
+(* A number box showing [value]; what is typed is handed to [on_commit] on blur or Enter (the
+   owner re-renders with the accepted value, or the old one if it was rejected). *)
+module Num_field = struct
+  let[@react.component] make ~id ~value ~on_commit ~className ~min ~max ~step
+      ~inputMode ~label ~disabled () =
+    let draft, set_draft = React.useState (fun () -> None) in
+    let commit () =
+      (match draft with Some d -> on_commit d | None -> ());
+      set_draft (fun _ -> None)
+    in
+    <input
+      type_="number"
+      id
+      className
+      min
+      max
+      step
+      inputMode
+      ariaLabel=label
+      disabled
+      value=(match draft with Some d -> d | None -> value)
+      onFocus=(fun _ -> set_draft (fun _ -> Some value))
+      onChange=(fun e ->
+                 let v = Browser.target_value e in
+                 set_draft (fun _ -> Some v))
+      onBlur=(fun _ -> commit ())
+      onKeyDown=(fun e ->
+                  if React.Event.Keyboard.key e = "Enter" then commit ())
+    />
+end
+
+(* A segmented control: (key, label) buttons, the pressed one marked aria-pressed. *)
+module Seg = struct
+  let[@react.component] make ~id ~className ~label ~items ~pressed ~on_pick
+      ~disabled () =
+    <div className id role="group" ariaLabel=label>
+      (items
+      |> List.map (fun (k, text) ->
+          <button
+            key=k
+            type_="button"
+            ariaPressed=(if k = pressed then "true" else "false")
+            disabled
+            onClick=(fun _ -> if not disabled then on_pick k)>
+            (React.string text)
+          </button>)
+      |> Array.of_list |> React.array)
+    </div>
+end
+
+let parse_float s =
+  match float_of_string_opt (String.trim s) with
+  | Some x when Float.is_finite x -> Some x
+  | _ -> None
+
+module Rep_canvas = struct
+  let[@react.component] make ~(settings : Settings.t) ~(rep : Rep.t) ~target_kg
+      ~wide () =
+    let r = React.useRef Js.Nullable.null in
+    (* A light/dark switch: re-read the CSS colours and redraw now, not at the next render. *)
+    let _, redraw = React.useReducer (fun n () -> n + 1) 0 in
+    React.useEffect0 (fun () ->
+        Some
+          (Browser.on_color_scheme_change (fun () ->
+               Timer_draw.colors.read_at <- neg_infinity;
+               redraw ())));
+    React.useEffect (fun () ->
+        (match Browser.ref_canvas r with
+        | Some cv ->
+            Timer_draw.maybe_read_colors (Browser.canvas_element cv);
+            Timer_draw.rep cv settings rep ~target_kg ~axis:wide
+        | None -> ());
+        None);
+    <canvas
+      ref=(ReactDOM.Ref.domRef r) className=(if wide then "wide" else "spark")
+    />
+end
+
+(* The MVP's summaryHTML: reps, total time, average median, average SD, mean deviation. *)
+module Summary_cells = struct
+  let[@react.component] make ~id ~(settings : Settings.t) ~(set : History.set)
+      () =
+    let s = Summary.of_set set in
+    let cell label v =
+      <div key=label>
+        <span className="label">(React.string label)</span>
+        <span className="v">v</span>
+      </div>
+    in
+    <div className="summary" id>
+      (cell "Reps" (React.string (string_of_int s.reps)))
+      (cell "Time" (React.string (Timer_ui.secs1 s.total_seconds)))
+      (cell "Avg median"
+         (React.string (Timer_ui.fmt ~digits:2 settings s.avg_median_kg)))
+      (cell "Avg SD"
+         (React.string (Timer_ui.fmt ~digits:2 settings s.avg_sd_kg)))
+      (cell "Off target"
+         (<>
+            (React.string
+               (Timer_ui.signed (Settings.to_display settings s.dev_kg) 2 ^ " "))
+            <small>(React.string (Timer_ui.signed s.dev_pct 1 ^ "%"))</small>
+          </>))
+    </div>
+end
+
+(* The rep list: newest first; a row opens to show the percentiles. [wide]: the set sheet's
+   layout, with a full-width graph under each row instead of a sparkline. *)
+module Rep_list = struct
+  let[@react.component] make ~id ~(settings : Settings.t) ~(set : History.set)
+      ~wide () =
+    let opened, set_opened = React.useState (fun () -> None) in
+    let u = Timer_ui.unit_ settings in
+    <ul className="reps" id>
+      (List.mapi (fun i r -> (i, r)) set.reps
+      |> List.rev
+      |> List.map (fun (i, (r : Rep.t)) ->
+          let pct, dev = Summary.rep_deviation set r in
+          let col =
+            match dev with
+            | Summary.On_target -> "var(--ok)"
+            | Heavy -> "var(--heavy)"
+            | Light -> "var(--light)"
+          in
+          let is_open = opened = Some i in
+          <li
+            key=(string_of_int i) className=(if wide then "rep big" else "rep")>
+            <button
+              type_="button"
+              ariaExpanded=is_open
+              onClick=(fun _ ->
+                        set_opened (fun o ->
+                            if o = Some i then None else Some i))>
+              <span className="n">(React.string (string_of_int (i + 1)))</span>
+              <span className="main">
+                <span>
+                  <b className="rep-secs">
+                    (React.string (Timer_ui.secs1 r.seconds))
+                  </b>
+                  (React.string {js| · median |js})
+                  <b>
+                    (React.string (Timer_ui.fmt ~digits:2 settings r.median_kg))
+                  </b>
+                  (React.string (" " ^ u))
+                </span>
+                <span className="sub">
+                  (React.string
+                     ("SD "
+                     ^ Timer_ui.fmt ~digits:2 settings r.sd_kg
+                     ^ {js| · mean |js}
+                     ^ Timer_ui.fmt ~digits:2 settings r.mean_kg
+                     ^ {js| · |js}))
+                  <span style=(ReactDOM.Style.make ~color:col ())>
+                    (React.string
+                       (Timer_ui.signed
+                          (Settings.to_display settings r.dev_kg)
+                          2
+                       ^ " (" ^ Timer_ui.signed pct 1 ^ "%)"))
+                  </span>
+                </span>
+              </span>
+              (if wide then React.null
+               else
+                 <Rep_canvas
+                   settings rep=r target_kg=set.target_kg wide=false
+                 />)
+            </button>
+            (if wide then
+               <Rep_canvas settings rep=r target_kg=set.target_kg wide=true />
+             else React.null)
+            (if is_open then
+               let ps = Rep.percentile_list r.pct_kg in
+               <div className="detail">
+                 <table className="pct">
+                   <tbody>
+                     <tr>
+                       (ps
+                       |> List.map (fun (k, _) ->
+                           <th key=k>(React.string k)</th>)
+                       |> Array.of_list |> React.array)
+                     </tr>
+                     <tr>
+                       (ps
+                       |> List.map (fun (k, v) ->
+                           <td key=k>
+                             (React.string (Timer_ui.fmt ~digits:2 settings v))
+                           </td>)
+                       |> Array.of_list |> React.array)
+                     </tr>
+                   </tbody>
+                 </table>
+               </div>
+             else React.null)
+          </li>)
+      |> Array.of_list |> React.array)
+    </ul>
+end
+
+(* Manual mode's set summary: there is no force, so reps and times only. *)
+module Manual_summary = struct
+  let[@react.component] make ~id ~(set : History.set) () =
+    let holds = List.map (fun (r : Rep.t) -> r.seconds) set.reps in
+    let cell label v =
+      <div key=label>
+        <span className="label">(React.string label)</span>
+        <span className="v">(React.string v)</span>
+      </div>
+    in
+    <div className="summary" id>
+      (cell "Reps" (string_of_int (List.length holds)))
+      (cell "Rep 1"
+         (match holds with h :: _ -> Timer_ui.secs1 h | [] -> {js|—|js}))
+      (cell "Time" (Timer_ui.secs1 (List.fold_left ( +. ) 0. holds)))
+    </div>
+end
+
+(* Manual mode's rep list: hold times, newest first (no force, so no graph or stats). *)
+module Hold_list = struct
+  let[@react.component] make ~id ~(set : History.set) () =
+    <ul className="reps" id>
+      (List.mapi (fun i r -> (i, r)) set.reps
+      |> List.rev
+      |> List.map (fun (i, (r : Rep.t)) ->
+          <li key=(string_of_int i) className="rep big">
+            <div className="rep-plain">
+              <span className="n">(React.string (string_of_int (i + 1)))</span>
+              <span className="main">
+                <span>
+                  <b className="rep-secs">
+                    (React.string (Timer_ui.secs1 r.seconds))
+                  </b>
+                </span>
+              </span>
+            </div>
+          </li>)
+      |> Array.of_list |> React.array)
+    </ul>
+end

@@ -1,0 +1,4 @@
+; Only OCaml lives in web/ and timer_core/ (the set timer's logic). Keep dune out of npm
+; packages, scripts and build output.
+
+(dirs :standard \ node_modules scripts tests dist)

@@ -1,0 +1,473 @@
+(* The settings panel: sounds, the set's timings and thresholds, the page size and keep-awake
+   (App_prefs), the Progressor's tare, PowerCurve, and the diagnostic log. There is no units
+   setting: the app is lbs only. *)
+
+open Timer_core
+module E = Timer_engine
+
+let number_field (t : E.t) ~id ~label ~field ~(get : Settings.t -> float) ~step
+    ?hint ?(disabled = false) () =
+  let lo, hi = Settings.limits field in
+  <div className=(if disabled then "field locked" else "field") key=id>
+    <label htmlFor=id>(React.string label)</label>
+    <Timer_parts.Num_field
+      id
+      className=""
+      value=(Js.Float.toString (get (E.settings t)))
+      min=(Js.Float.toString lo)
+      max=(Js.Float.toString hi)
+      step
+      inputMode="decimal"
+      label
+      disabled
+      on_commit=(fun v ->
+                  match Timer_parts.parse_float v with
+                  | Some x -> (
+                      match Settings.set_number (E.settings t) field x with
+                      | Some s -> E.change t s
+                      | None -> ())
+                  | None -> ())
+    />
+    (match hint with
+    | Some h -> <p className="hint" id=(id ^ "Hint")>(React.string h)</p>
+    | None -> React.null)
+  </div>
+
+module Help = struct
+  let[@react.component] make ~id ~about ~text () =
+    let shown, set_shown = React.useState (fun () -> false) in
+    <>
+      <button
+        className="help"
+        type_="button"
+        ariaExpanded=shown
+        ariaControls=id
+        ariaLabel=("About " ^ about)
+        onClick=(fun _ -> set_shown (fun v -> not v))>
+        (React.string "?")
+      </button>
+      (if shown then <p className="hint" id>(React.string text)</p>
+       else React.null)
+    </>
+end
+
+module Log_view = struct
+  let[@react.component] make ~(t : E.t) () =
+    let pre = React.useRef Js.Nullable.null
+    and count = React.useRef Js.Nullable.null in
+    React.useEffect0 (fun () ->
+        (match (Browser.ref_el pre, Browser.ref_el count) with
+        | Some p, Some c ->
+            Timer_log.attach (E.diagnostics t) p (fun s ->
+                Browser.set_text_content c s)
+        | _ -> ());
+        Some (fun () -> Timer_log.detach (E.diagnostics t)));
+    let diag =
+      "Web Bluetooth: "
+      ^ (match Browser.bluetooth () with
+        | Some _ -> "available"
+        | None -> "not available")
+      ^ {js| · |js}
+      ^ (if Browser.top_level () then "top-level page" else "embedded frame")
+      ^ {js| · |js}
+      ^ Js.String.slice ~start:0 ~end_:120 Browser.user_agent
+    in
+    <div className="sub-body">
+      <div className="panel-head">
+        <span className="label">
+          (React.string "Log since this page opened")
+        </span>
+        <button
+          className="linkish"
+          id="copyLog"
+          type_="button"
+          onClick=(fun _ ->
+                    ignore
+                      (Js.Promise.then_
+                         (fun ok ->
+                           E.toast t
+                             (if ok then "Copied" else "Couldn't copy here");
+                           Js.Promise.resolve ())
+                         (Browser.copy_text
+                            (Timer_log.text (E.diagnostics t) ^ "\n" ^ diag))))>
+          (React.string "Copy log")
+        </button>
+      </div>
+      <pre id="connLog" ref=(ReactDOM.Ref.domRef pre) />
+      <p className="hint" id="logCount" ref=(ReactDOM.Ref.domRef count) />
+      <p className="diag" id="diag">(React.string diag)</p>
+    </div>
+end
+
+module Token_field = struct
+  let[@react.component] make ~(t : E.t) () =
+    let draft, set_draft = React.useState (fun () -> None) in
+    let commit () =
+      (match draft with Some d -> E.set_pc_token t d | None -> ());
+      set_draft (fun _ -> None)
+    in
+    <input
+      type_="password"
+      id="pcToken"
+      className="token"
+      placeholder={js|pcgg_…|js}
+      autoComplete="off"
+      spellCheck=false
+      autoCapitalize="off"
+      value=(match draft with
+            | Some d -> d
+            | None -> if E.pc_token_error t then "" else E.pc_token t)
+      onFocus=(fun _ -> set_draft (fun _ -> Some (E.pc_token t)))
+      onChange=(fun e ->
+                 let v = Browser.target_value e in
+                 set_draft (fun _ -> Some v))
+      onBlur=(fun _ -> commit ())
+      onKeyDown=(fun e ->
+                  if React.Event.Keyboard.key e = "Enter" then commit ())
+    />
+end
+
+let[@react.component] make ~(t : E.t) () =
+  let opened, set_opened = React.useState (fun () -> false) in
+  let adv, set_adv = React.useState (fun () -> false) in
+  let diag, set_diag = React.useState (fun () -> false) in
+  let s = E.settings t in
+  let u = Settings.unit_label s in
+  let fmt kg = Settings.format s kg in
+  let toggle set e =
+    React.Event.Mouse.preventDefault e;
+    set (fun o -> not o)
+  in
+  let valid = E.pc_valid t in
+  (* Mid-set, what shapes the set is locked (Timer_engine.change holds it too, whatever asks);
+     sounds, volume, page size, keep awake, graph delay and PowerCurve stay editable. *)
+  let locked = E.in_set t in
+  (* Manual mode measures no force: the force thresholds, tare and the graph delay don't apply,
+     so they are not shown (their values are kept for when it is switched off). *)
+  let manual = E.manual t in
+  let app = App_prefs.use () in
+  <details className="panel" id="settingsPanel" open_=opened>
+    <summary onClick=(toggle set_opened)>
+      <h2>(React.string "Settings")</h2>
+    </summary>
+    (if not opened then React.null
+     else
+       <div className="settings">
+         (if locked then
+            <p className="hint" id="settingsLocked">
+              (React.string
+                 "The Set settings are locked while a set is in progress.")
+            </p>
+          else React.null)
+         <div className="field">
+           <label htmlFor="soundOn">(React.string "Sounds")</label>
+           <span className="row">
+             <button
+               className="btn small"
+               id="testSound"
+               type_="button"
+               onClick=(fun _ ->
+                         E.unlock_audio t;
+                         E.play t Sound.test_tones)>
+               (React.string "Test sound")
+             </button>
+             <input
+               type_="checkbox"
+               id="soundOn"
+               checked=s.sound
+               onChange=(fun e ->
+                            E.unlock_audio t;
+                            E.change t
+                              {
+                                (E.settings t) with
+                                sound = Browser.target_checked e;
+                              })
+             />
+           </span>
+         </div>
+         <div className="field">
+           <label htmlFor="volume">(React.string "Volume")</label>
+           <span className="vol">
+             <input
+               type_="range"
+               id="volume"
+               min="10"
+               max="150"
+               step=5.
+               value=(Js.Float.toString s.volume)
+               onChange=(fun e ->
+                          match
+                            Timer_parts.parse_float (Browser.target_value e)
+                          with
+                          | Some v ->
+                              E.change t { (E.settings t) with volume = v }
+                          | None -> ())
+               onPointerUp=(fun _ ->
+                             E.unlock_audio t;
+                             E.play t [ Sound.volume_preview ])
+             />
+             <output htmlFor="volume" id="volumeOut">
+               (React.string (Js.Float.toString s.volume ^ "%"))
+             </output>
+           </span>
+         </div>
+         <div className="group-title">(React.string "Set")</div>
+         (number_field t ~id:"countdownS"
+            ~label:"Countdown before first rep (s)" ~field:Settings.Countdown_s
+            ~get:(fun s -> s.countdown_s)
+            ~step:5. ~disabled:locked ())
+         (number_field t ~id:"restS" ~label:"Rest between reps (s)"
+            ~field:Settings.Rest_s
+            ~get:(fun s -> s.rest_s)
+            ~step:5. ~disabled:locked ())
+         (if manual then React.null
+          else
+            number_field t ~id:"engPct"
+              ~label:"Rep can end once force reaches (% of target)"
+              ~field:Settings.Eng_pct
+              ~get:(fun s -> s.eng_pct)
+              ~step:5. ~disabled:locked ())
+         (if manual then React.null
+          else
+            number_field t ~id:"disPct"
+              ~label:"Rep ends when force drops below (% of target)"
+              ~field:Settings.Dis_pct
+              ~get:(fun s -> s.dis_pct)
+              ~step:5.
+              ~hint:
+                ("Each rep starts at 0 and ends the first time force drops \
+                  below "
+                ^ fmt (Settings.fail_kg s)
+                ^ " " ^ u ^ " ("
+                ^ Js.Float.toString s.dis_pct
+                ^ "%) after reaching "
+                ^ fmt (Settings.engage_kg s)
+                ^ " " ^ u ^ " ("
+                ^ Js.Float.toString s.eng_pct
+                ^ "%).")
+              ~disabled:locked ())
+         (if manual then React.null
+          else
+            number_field t ~id:"tolPct" ~label:{js|On-target tolerance (± %)|js}
+              ~field:Settings.Tol_pct
+              ~get:(fun s -> s.tol_pct)
+              ~step:0.5
+              ~hint:
+                ({js|During a rep, within ±|js}
+                ^ fmt (Settings.tolerance_kg s)
+                ^ " " ^ u ^ " of the target ("
+                ^ Js.Float.toString s.tol_pct
+                ^ "%) is on target and silent. Outside it, a high tone (too \
+                   heavy) or low tone (too light) plays every half second.")
+              ~disabled:locked ())
+         (if manual then React.null
+          else
+            <>
+              <div className="group-title">(React.string "Device")</div>
+              <div className="field">
+                <label htmlFor="tareBtn">
+                  (React.string "Zero the Progressor")
+                </label>
+                <button
+                  className="btn small"
+                  id="tareBtn"
+                  type_="button"
+                  disabled=(E.conn t <> E.Live || E.in_set t)
+                  onClick=(fun _ -> E.tare t)>
+                  (React.string "Tare")
+                </button>
+              </div>
+            </>)
+         <div className="group-title">(React.string "Display")</div>
+         <div className="field">
+           <label htmlFor="zoomInput">(React.string "Page size (%)")</label>
+           <span className="row">
+             <button
+               className="btn small"
+               type_="button"
+               id="zMinus"
+               ariaLabel="Smaller page"
+               onClick=(fun _ -> App_prefs.step_page_zoom (-1))>
+               (React.string {js|−|js})
+             </button>
+             <Timer_parts.Num_field
+               id="zoomInput"
+               className=""
+               value=(Js.Float.toString app.page_zoom)
+               min="50"
+               max="150"
+               step=5.
+               inputMode="numeric"
+               label="Page size in percent"
+               disabled=false
+               on_commit=(fun v ->
+                             match Timer_parts.parse_float v with
+                             | Some x -> App_prefs.set_page_zoom x
+                             | None -> ())
+             />
+             <button
+               className="btn small"
+               type_="button"
+               id="zPlus"
+               ariaLabel="Larger page"
+               onClick=(fun _ -> App_prefs.step_page_zoom 1)>
+               (React.string "+")
+             </button>
+           </span>
+           <p className="hint">
+             (React.string
+                {js|Scales the whole page (85 % by default; Bluefy has no zoom of its own).|js})
+           </p>
+         </div>
+         <div className="field">
+           <label htmlFor="keepAwake">
+             (React.string
+                "Keep the screen awake while the Progressor is connected")
+           </label>
+           <input
+             type_="checkbox"
+             id="keepAwake"
+             checked=app.keep_awake
+             onChange=(fun e ->
+                          App_prefs.set_keep_awake (Browser.target_checked e))
+           />
+         </div>
+         <div className="field">
+           <label>(React.string "Offline use")</label>
+           <p className="hint" id="offlineCopy">
+             (React.string
+                (match Browser.offline_copy () with
+                | `Ready ->
+                    "A copy of the app is kept in this browser: it opens \
+                     without a connection."
+                | `Not_yet ->
+                    {js|The app is being saved in this browser. Reload once to check.|js}
+                | `Unsupported ->
+                    "This browser can't keep the app on the device, so opening \
+                     it needs a connection."))
+           </p>
+         </div>
+         <div className="group-title">(React.string "PowerCurve")</div>
+         <div className="field">
+           <label htmlFor="pcAuto">
+             (React.string "Auto-upload finished sets to PowerCurve")
+           </label>
+           <input
+             type_="checkbox"
+             id="pcAuto"
+             checked=s.pc_auto
+             onChange=(fun e ->
+                          E.change t
+                            {
+                              (E.settings t) with
+                              pc_auto = Browser.target_checked e;
+                            })
+           />
+         </div>
+         <div className="field">
+           <label htmlFor="pcToken">(React.string "Upload token")</label>
+           <Token_field t />
+           <p
+             className=(if E.pc_token_error t || (s.pc_auto && not valid) then
+                          "hint bad"
+                        else "hint")
+             id="pcTokenHint">
+             (React.string
+                (if E.pc_token_error t then
+                   {js|That isn't a PowerCurve upload token. It should be pcgg_ followed by 64 characters (0–9, a–f).|js}
+                 else if valid then
+                   "Saved in this browser only."
+                   ^
+                   if s.pc_auto then " Each set uploads when it's saved."
+                   else
+                     " Turn on auto-upload, or upload a set from its details \
+                      in History."
+                 else
+                   (if s.pc_auto then "Auto-upload needs a token. " else "")
+                   ^ "Paste the token from PowerCurve's Grip Gains import \
+                      helper (it starts with pcgg_). It's kept only on this \
+                      device and sent only to PowerCurve."))
+           </p>
+         </div>
+         <details className="sub" id="advancedPanel" open_=adv>
+           <summary onClick=(toggle set_adv)>(React.string "Advanced")</summary>
+           (if not adv then React.null
+            else
+              <div className="sub-body">
+                <fieldset className="modes">
+                  <legend>(React.string "Sound mode")</legend>
+                  <div className="mode">
+                    <label>
+                      <input
+                        type_="radio"
+                        name="soundMode"
+                        value="mix"
+                        checked=(s.sound_mode = Settings.Mix)
+                        onChange=(fun _ ->
+                                     E.change t
+                                       {
+                                         (E.settings t) with
+                                         sound_mode = Settings.Mix;
+                                       };
+                                     (* switch the audio mode now, inside this tap *)
+                                     E.unlock_audio t;
+                                     E.log t "Sound mode: mix with music")
+                      />
+                      (React.string " Mix with music")
+                    </label>
+                    <Help
+                      id="helpMix"
+                      about="Mix with music"
+                      text="Default. Beeps play on top of music from other \
+                            apps (Spotify) without pausing it. With headphones \
+                            (AirPods) they always play; on the phone's own \
+                            speaker, iPhone silent mode mutes them."
+                    />
+                  </div>
+                  <div className="mode">
+                    <label>
+                      <input
+                        type_="radio"
+                        name="soundMode"
+                        value="over"
+                        checked=(s.sound_mode = Settings.Over)
+                        onChange=(fun _ ->
+                                     E.change t
+                                       {
+                                         (E.settings t) with
+                                         sound_mode = Settings.Over;
+                                       };
+                                     E.unlock_audio t;
+                                     E.log t
+                                       "Sound mode: play in silent mode \
+                                        (pauses other music)")
+                      />
+                      (React.string " Play in silent mode")
+                    </label>
+                    <Help
+                      id="helpOver"
+                      about="Play in silent mode"
+                      text="Beeps play even on the phone's speaker in silent \
+                            mode, but iOS pauses music from other apps while \
+                            this page has sound. Useful without music. After \
+                            switching back to Mix with music, reload the page: \
+                            iOS keeps the first mode a page uses."
+                    />
+                  </div>
+                </fieldset>
+                (if manual then React.null
+                 else
+                   number_field t ~id:"renderDelayMs" ~label:"Graph delay (ms)"
+                     ~field:Settings.Render_delay_ms
+                     ~get:(fun s -> s.render_delay_ms)
+                     ~step:50. ())
+              </div>)
+         </details>
+         <details className="sub" id="diagPanel" open_=diag>
+           <summary onClick=(toggle set_diag)>
+             (React.string "Diagnostic logs")
+           </summary>
+           (if diag then <Log_view t /> else React.null)
+         </details>
+       </div>)
+  </details>

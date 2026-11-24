@@ -1,0 +1,472 @@
+(* History: the sets saved in this browser, most recent first, grouped by day. Rows open the
+   set sheet (rep graphs, or hold times for a manual set). Copy JSON and delete work for every
+   set; select mode copies or deletes several at once. *)
+
+open Timer_core
+module E = Timer_engine
+
+type entry = {
+  id : string;
+  summary : Timer_summary.t;
+  record : Timer_db.record;
+}
+
+(* Sets still recording or in review are the current set, not history. *)
+let entries (t : E.t) : entry list =
+  Timer_sets.records (E.sets t)
+  |> List.filter (fun (r : Timer_db.record) -> r.status <> Timer_db.Recording)
+  |> List.filter_map (fun (r : Timer_db.record) ->
+      Option.map
+        (fun summary -> { id = r.id; summary; record = r })
+        (Timer_summary.of_json r.summary))
+  |> List.sort (fun a b ->
+      match Float.compare b.summary.performed_at a.summary.performed_at with
+      | 0 -> String.compare b.id a.id
+      | c -> c)
+
+let weight_text (s : Settings.t) lbs =
+  Timer_ui.disp1 s (Timer_summary.kg_of_lbs lbs) ^ " " ^ Settings.unit_label s
+
+let export (es : entry list) =
+  Timer_summary.export_json
+    (List.map (fun e -> Timer_summary.export_obj e.summary) es)
+
+let copy (t : E.t) es =
+  ignore
+    (Js.Promise.then_
+       (fun ok ->
+         E.toast t (if ok then "Copied" else "Couldn't copy here");
+         Js.Promise.resolve ())
+       (Browser.copy_text (export es)))
+
+let status_badges (t : E.t) (e : entry) =
+  let b cls text = <span key=text className=cls>(React.string text)</span> in
+  let items =
+    (if e.summary.manual then [ b "pcmark manual" "Manual" ] else [])
+    @
+    match e.record.pc with
+    | Some "uploaded" -> [ b "pcmark ok" {js|PC ✓|js} ]
+    | Some "uploading" when E.pc_in_flight t e.id -> [ b "pcmark" {js|PC…|js} ]
+    (* an upload cut off by closing the page: failed, retry from the set *)
+    | Some ("uploading" | "failed") -> [ b "pcmark bad" {js|PC ✗|js} ]
+    | _ -> []
+  in
+  React.array (Array.of_list items)
+
+let[@react.component] make ~(t : E.t) () =
+  let opened, set_opened = React.useState (fun () -> false) in
+  let selecting, set_selecting = React.useState (fun () -> false) in
+  let selected, set_selected = React.useState (fun () -> []) in
+  let delete_armed, set_delete_armed = React.useState (fun () -> false) in
+  let s = E.settings t in
+  (* Rebuilt only when the records change, not on every render. *)
+  let es =
+    React.useMemo1 (fun () -> entries t) [| Timer_sets.records (E.sets t) |]
+  in
+  let n = List.length es in
+  let exit_select () =
+    set_selecting (fun _ -> false);
+    set_selected (fun _ -> []);
+    set_delete_armed (fun _ -> false)
+  in
+  let chosen = List.filter (fun e -> List.mem e.id selected) es in
+  let bar =
+    if n = 0 then React.null
+    else if not selecting then
+      <div className="history-bar" id="historyBar">
+        <span />
+        <button
+          className="btn small"
+          type_="button"
+          onClick=(fun _ -> set_selecting (fun _ -> true))>
+          (React.string "Select")
+        </button>
+      </div>
+    else
+      let all = List.length chosen = n in
+      let k = List.length chosen in
+      <div className="history-bar" id="historyBar">
+        <button
+          className="linkish"
+          type_="button"
+          onClick=(fun _ ->
+                    set_selected (fun _ ->
+                        if all then [] else List.map (fun e -> e.id) es);
+                    set_delete_armed (fun _ -> false))>
+          (React.string (if all then "Clear all" else "Select all"))
+        </button>
+        <span className="row">
+          <button
+            className="btn small primary"
+            type_="button"
+            id="tm-copy-selected"
+            disabled=(k = 0)
+            onClick=(fun _ ->
+                      if chosen <> [] then begin
+                        copy t chosen;
+                        exit_select ()
+                      end)>
+            (React.string ("Copy " ^ if k > 0 then string_of_int k else ""))
+          </button>
+          <button
+            className="btn small danger"
+            type_="button"
+            disabled=(k = 0)
+            onClick=(fun _ ->
+                      if chosen <> [] then
+                        if not delete_armed then begin
+                          set_delete_armed (fun _ -> true);
+                          ignore
+                            (Js.Global.setTimeout
+                               ~f:(fun () -> set_delete_armed (fun _ -> false))
+                               3000)
+                        end
+                        else begin
+                          List.iter (fun e -> E.delete_set t e.id) chosen;
+                          exit_select ()
+                        end)>
+            (React.string
+               (if delete_armed && k > 0 then
+                  "Delete " ^ string_of_int k ^ "? Click again"
+                else "Delete " ^ if k > 0 then string_of_int k else ""))
+          </button>
+          <button
+            className="btn small"
+            type_="button"
+            onClick=(fun _ -> exit_select ())>
+            (React.string "Done")
+          </button>
+        </span>
+      </div>
+  in
+  <details className="panel" id="historyPanel" open_=opened>
+    <summary
+      onClick=(fun e ->
+                React.Event.Mouse.preventDefault e;
+                set_opened (fun o -> not o))>
+      <h2>(React.string "History")</h2>
+      <span className="count" id="historyCount">
+        (React.string (if n > 0 then Timer_ui.plural n "set" else ""))
+      </span>
+    </summary>
+    (if not opened then React.null
+     else
+       <>
+         bar
+         <div
+           className=(if selecting then "history selecting" else "history")
+           id="history">
+           (if es = [] then
+              <p className="empty">
+                (React.string
+                   "Finished sets appear here. Open one for its rep graphs, or \
+                    Copy for its JSON.")
+              </p>
+            else
+              let last_day = ref "" in
+              es
+              |> List.map (fun e ->
+                  let day = Timer_ui.day_key e.summary.performed_at in
+                  let heading =
+                    if day <> !last_day then begin
+                      last_day := day;
+                      <div className="day" key=("d" ^ day)>
+                        (React.string
+                           (Timer_ui.day_label e.summary.performed_at))
+                      </div>
+                    end
+                    else React.null
+                  in
+                  let is_sel = List.mem e.id selected in
+                  let name = E.gripper_name e.summary.gripper in
+                  let rep1 =
+                    if Array.length e.summary.rep_seconds > 0 then
+                      string_of_int
+                        (int_of_float (Float.floor e.summary.rep_seconds.(0)))
+                      ^ "s"
+                    else {js|—|js}
+                  in
+                  <React.Fragment key=e.id>
+                    heading
+                    <div className="hrow" id=("h-" ^ e.id)>
+                      (let label =
+                         (if selecting then
+                            if is_sel then "Deselect " else "Select "
+                          else "Open ")
+                         ^ name ^ " " ^ e.summary.side ^ " set"
+                       in
+                       let on_click _ =
+                         if not selecting then E.open_sheet t e.id
+                         else begin
+                           set_selected (fun l ->
+                               if List.mem e.id l then
+                                 List.filter (( <> ) e.id) l
+                               else e.id :: l);
+                           set_delete_armed (fun _ -> false)
+                         end
+                       in
+                       let body =
+                         <>
+                           (if selecting then
+                              <span className="check" ariaHidden=true>
+                                (React.string
+                                   (if is_sel then {js|✓|js} else ""))
+                              </span>
+                            else React.null)
+                           <span className="g">(React.string name)</span>
+                           <span className="s">
+                             (React.string (Timer_ui.side_label e.summary.side))
+                           </span>
+                           <span className="w">
+                             (React.string
+                                (weight_text s e.summary.weight_lbs ^ " "))
+                             (status_badges t e)
+                           </span>
+                           <span className="first">(React.string rep1)</span>
+                         </>
+                       in
+                       if selecting then
+                         <button
+                           type_="button"
+                           className="open"
+                           ariaLabel=label
+                           ariaPressed=(if is_sel then "true" else "false")
+                           onClick=on_click>
+                           body
+                         </button>
+                       else
+                         <button
+                           type_="button"
+                           className="open"
+                           ariaLabel=label
+                           onClick=on_click>
+                           body
+                         </button>)
+                      (if selecting then React.null
+                       else
+                         <button
+                           type_="button"
+                           className="btn small"
+                           onClick=(fun _ -> copy t [ e ])>
+                           (React.string "Copy")
+                         </button>)
+                    </div>
+                  </React.Fragment>)
+              |> Array.of_list |> React.array)
+         </div>
+       </>)
+  </details>
+
+(* The set sheet: one saved set in full. *)
+module Sheet = struct
+  let[@react.component] make ~(t : E.t) ~(sh : E.sheet) () =
+    let s = E.settings t in
+    let close_ref = React.useRef Js.Nullable.null in
+    React.useEffect0 (fun () ->
+        Option.iter Browser.focus (Browser.ref_el close_ref);
+        None);
+    match List.find_opt (fun e -> e.id = sh.sheet_id) (entries t) with
+    | None -> React.null
+    | Some e ->
+        let sm = e.summary in
+        let name = E.gripper_name sm.gripper in
+        let trace = sh.trace in
+        (* A manual set's "trace" is rebuilt from its record (Timer_sets.trace) for the
+           PowerCurve state; it has hold times only, so it shows like a set with no trace. *)
+        let graphs =
+          match trace with Some _ -> not sm.manual | None -> false
+        in
+        let meta =
+          Timer_ui.when_label sm.performed_at
+          ^ (match trace with
+            | Some set when graphs ->
+                {js| · countdown |js}
+                ^ Js.Float.toString set.countdown_s
+                ^ {js|s · rest |js}
+                ^ Js.Float.toString set.rest_s
+                ^ {js|s · ends below |js}
+                ^ Js.Float.toString set.rep_end_below_pct
+                ^ "% after "
+                ^ Js.Float.toString set.rep_end_after_pct
+                ^ "%"
+            | _ ->
+                {js| · rest |js}
+                ^ Js.Float.toString sm.rest_s
+                ^ {js|s · |js}
+                ^ string_of_int sm.planned_reps
+                ^ " reps planned")
+          ^
+          match
+            if Array.length sm.rep_seconds > 0 then
+              Set_types.classify sm.rep_seconds.(0)
+            else None
+          with
+          | Some ty -> {js| · |js} ^ Set_types.label ty
+          | None -> ""
+        in
+        let pc =
+          match trace with Some set -> E.pc_state t e.id set | None -> None
+        in
+        let pc_line, pc_bad =
+          match (trace, pc) with
+          | None, _ -> ("", false)
+          | Some set, Some (History.Uploaded { result; performance; _ }) ->
+              ( "Uploaded to PowerCurve"
+                ^ (if result = "merged" then
+                     " (merged with an existing session)"
+                   else "")
+                ^ ". "
+                ^ History.rank_text performance { set with gripper = name },
+                false )
+          | Some _, Some History.Uploading ->
+              ({js|Uploading to PowerCurve…|js}, false)
+          | Some _, Some (History.Failed { message; _ }) ->
+              ("PowerCurve upload failed: " ^ message, true)
+          | Some _, _ ->
+              if E.pc_valid t then ("Not uploaded to PowerCurve.", false)
+              else ("Add a PowerCurve token in Settings to upload sets.", false)
+        in
+        let uploaded =
+          match pc with Some (History.Uploaded _) -> true | _ -> false
+        in
+        let uploading =
+          match pc with Some History.Uploading -> true | _ -> false
+        in
+        <div
+          className="scrim"
+          id="sheetScrim"
+          onClick=(fun ev ->
+                    if Browser.has_class (Browser.mouse_target ev) "scrim" then
+                      E.close_sheet t)>
+          <div
+            className="sheet"
+            role="dialog"
+            ariaModal=true
+            ariaLabelledby="sheetTitle"
+            id="sheet">
+            <div className="panel-head">
+              <div>
+                <h2 id="sheetTitle">
+                  (React.string
+                     (name ^ {js| · |js}
+                     ^ Timer_ui.side_label sm.side
+                     ^ {js| · |js}
+                     ^ weight_text s sm.weight_lbs))
+                </h2>
+                <p className="meta" id="sheetMeta">(React.string meta)</p>
+              </div>
+              <button
+                className="btn small"
+                id="sheetClose"
+                type_="button"
+                ref=(ReactDOM.Ref.domRef close_ref)
+                onClick=(fun _ -> E.close_sheet t)>
+                (React.string "Close")
+              </button>
+            </div>
+            (match trace with
+            | Some set when graphs ->
+                <>
+                  <Timer_parts.Summary_cells id="sheetSummary" settings=s set />
+                  <Timer_parts.Rep_list
+                    id="sheetReps" settings=s set wide=true
+                  />
+                </>
+            | _ ->
+                let holds = Array.to_list sm.rep_seconds in
+                <>
+                  <div className="summary" id="sheetSummary">
+                    <div>
+                      <span className="label">(React.string "Reps")</span>
+                      <span className="v">
+                        (React.string (string_of_int (List.length holds)))
+                      </span>
+                    </div>
+                    <div>
+                      <span className="label">(React.string "Rep 1")</span>
+                      <span className="v">
+                        (React.string
+                           (match holds with
+                           | h :: _ -> Timer_ui.secs1 h
+                           | [] -> {js|—|js}))
+                      </span>
+                    </div>
+                    <div>
+                      <span className="label">(React.string "Time")</span>
+                      <span className="v">
+                        (React.string
+                           (Timer_ui.secs1 (List.fold_left ( +. ) 0. holds)))
+                      </span>
+                    </div>
+                  </div>
+                  <ul className="reps" id="sheetReps">
+                    (List.mapi
+                       (fun i h ->
+                         <li key=(string_of_int i) className="rep big">
+                           <div className="rep-plain">
+                             <span className="n">
+                               (React.string (string_of_int (i + 1)))
+                             </span>
+                             <span className="main">
+                               <span>
+                                 <b>(React.string (Timer_ui.secs1 h))</b>
+                               </span>
+                             </span>
+                           </div>
+                         </li>)
+                       holds
+                    |> List.rev |> Array.of_list |> React.array)
+                  </ul>
+                  <p className="hint" id="sheetNoTrace">
+                    (React.string
+                       (if sh.loading then {js|Loading…|js}
+                        else if sm.manual then
+                          "Recorded in manual mode: hold times only (no force \
+                           was measured)."
+                        else
+                          "This set's rep graphs couldn't be read from this \
+                           browser's storage, so it shows the hold times only."))
+                  </p>
+                </>)
+            <div className="row">
+              (if trace = None then React.null
+               else
+                 <p
+                   className=(if pc_bad then "hint bad" else "hint")
+                   id="sheetPc"
+                   style=(ReactDOM.Style.make ~flex:"1 1 100%" ())>
+                   (React.string pc_line)
+                 </p>)
+              (match trace with
+              | Some set when (not uploaded) && E.pc_valid t ->
+                  <button
+                    className="btn"
+                    id="sheetUpload"
+                    type_="button"
+                    disabled=uploading
+                    onClick=(fun _ -> E.upload_pc t e.id set)>
+                    (React.string
+                       (if pc_bad then "Retry upload"
+                        else "Upload to PowerCurve"))
+                  </button>
+              | _ -> React.null)
+              <button
+                className="btn grow"
+                id="sheetCopy"
+                type_="button"
+                onClick=(fun _ -> copy t [ e ])>
+                (React.string "Copy JSON")
+              </button>
+              <button
+                className="btn danger"
+                id="sheetDelete"
+                type_="button"
+                onClick=(fun _ -> E.sheet_delete t)>
+                (React.string
+                   (if sh.delete_armed then "Click again to delete"
+                    else "Delete set"))
+              </button>
+            </div>
+          </div>
+        </div>
+end

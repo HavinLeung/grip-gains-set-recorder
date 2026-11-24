@@ -1,0 +1,4 @@
+(test
+ (name test_timer_core)
+ (modules test_timer_core)
+ (libraries timer_core))

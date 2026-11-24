@@ -1,0 +1,808 @@
+(* The Timer: a ReasonReact view over Timer_engine. From the top: readout, live graph, set
+   button, connect row, target panel, the set in progress, history, settings; the end-of-set
+   review and the set sheet are bottom sheets.
+
+   React renders the structure when the engine reports a change (connection, phase, reps, ...);
+   the numbers that move every frame (force, timer, deviation, progress bar) and the live graph
+   are written by the engine's frame loop through refs, so nothing re-renders 60 times a
+   second. ("MVP" in comments: the first version of this app, a single HTML page.) *)
+
+open Timer_core
+module E = Timer_engine
+
+(* --- the per-frame readout (the MVP's renderReadout, lines 1185-1232) --- *)
+
+type readout_refs = {
+  root : Dom.element Js.Nullable.t React.ref;
+  force_num : Dom.element Js.Nullable.t React.ref;
+  force_unit : Dom.element Js.Nullable.t React.ref;
+  phase : Dom.element Js.Nullable.t React.ref;
+  timer : Dom.element Js.Nullable.t React.ref;
+  dev : Dom.element Js.Nullable.t React.ref;
+  statline : Dom.element Js.Nullable.t React.ref;
+  progress : Dom.element Js.Nullable.t React.ref;
+  graph : Dom.element Js.Nullable.t React.ref;
+  rate : Dom.element Js.Nullable.t React.ref;
+}
+
+(* Write to the DOM only when the value changes (the readout refreshes every frame). *)
+let cached (cache : string Js.Dict.t) key r f v =
+  if Js.Dict.get cache key <> Some v then
+    match Browser.ref_el r with
+    | Some el ->
+        Js.Dict.set cache key v;
+        f el v
+    | None -> ()
+
+(* Pieces both readouts (with the Progressor and manual) share. *)
+
+let rep_heading ~rep_n ~planned =
+  "Rep " ^ string_of_int rep_n ^ " of " ^ string_of_int planned
+
+let countdown_text left = string_of_int (int_of_float (Float.ceil left)) ^ "s"
+
+(* The rep finished last in the set in progress. *)
+let last_rep (st : Session.t) : Rep.t option =
+  match st.current with
+  | Some c -> ( match List.rev c.reps with r :: _ -> Some r | [] -> None)
+  | None -> None
+
+(* Outside a set the timer shows the last rep of the set that ended last. *)
+let idle_timer (t : E.t) =
+  match E.last_set t with
+  | Some set when set.reps <> [] ->
+      Timer_ui.secs1 (List.nth set.reps (List.length set.reps - 1)).seconds
+  | _ -> "0.0s"
+
+(* "Rep 1 of 4 starts at 0. Crusher · Left · 45 lbs." *)
+let first_rep_line (t : E.t) ~planned =
+  let s = E.settings t in
+  "Rep 1 of " ^ string_of_int planned ^ " starts at 0. "
+  ^ Browser.esc (E.gripper_name s.gripper)
+  ^ {js| · |js} ^ Timer_ui.side_label s.side ^ {js| · |js}
+  ^ Settings.format ~digits:1 s s.target
+  ^ " " ^ Settings.unit_label s ^ "."
+
+let set_progress (refs : readout_refs) progress =
+  match Browser.ref_el refs.progress with
+  | Some el ->
+      Browser.style_set el "transform"
+        ("scaleX(" ^ Js.Float.toFixed ~digits:4 progress ^ ")")
+  | None -> ()
+
+let draw_frame_force (refs : readout_refs) cache (t : E.t) ~render_t ~now =
+  let s = E.settings t and st = E.session t in
+  let text key r v = cached cache key r Browser.set_text_content v in
+  let html key r v = cached cache key r Browser.set_inner_html v in
+  let cls key r v = cached cache key r Browser.set_class_name v in
+  let attr key r name v =
+    cached cache key r (fun el v -> Browser.set_attribute el name v) v
+  in
+  let u = Settings.unit_label s in
+  let fmt ?(d = 1) kg = Settings.format ~digits:d s kg in
+  let live = E.streaming t || E.conn t = E.Reconnecting in
+  let shown =
+    if live && Force_buffer.length (E.buffer t) > 0 then
+      Force_buffer.value_at (E.buffer t) render_t
+    else 0.
+  in
+  text "force" refs.force_num
+    (fmt (if Float.abs shown < 0.03 then 0. else shown));
+  text "unit" refs.force_unit u;
+  let reps = Session.reps_done st in
+  let rep_n = reps + 1 and planned = Session.planned_reps st in
+  let b x = "<b>" ^ x ^ "</b>" in
+  let off, ph, tm, tm_class, progress, dev_text, dev_class, line =
+    match st.phase with
+    | Session.Rep ->
+        let ph = rep_heading ~rep_n ~planned in
+        let tm =
+          Js.Float.toFixed ~digits:1 (Session.rep_elapsed st ~now) ^ "s"
+        in
+        if st.armed then
+          let d = st.force -. s.target in
+          let off =
+            if st.off_target then if d > 0. then "heavy" else "light" else "ok"
+          in
+          ( off,
+            ph,
+            tm,
+            "timer",
+            0.,
+            (Jsnum.signed (Settings.to_display s d) 1
+            ^ " " ^ u ^ " "
+            ^
+            if st.off_target then if d > 0. then "heavy" else "light"
+            else "on target"),
+            "dev " ^ off,
+            "Mean "
+            ^ b (fmt ~d:2 (Option.value ~default:0. st.live_mean))
+            ^ {js| · SD |js}
+            ^ b (fmt ~d:2 (Option.value ~default:0. st.live_sd))
+            ^ " " ^ u ^ {js| · ends below |js}
+            ^ b (fmt (Settings.fail_kg s)) )
+        else
+          ( "",
+            ph,
+            tm,
+            "timer",
+            0.,
+            "pull to " ^ fmt (Settings.engage_kg s) ^ " " ^ u,
+            "dev muted",
+            "Timer is running. The rep ends once you've reached "
+            ^ b (fmt (Settings.engage_kg s))
+            ^ " and then drop below "
+            ^ b (fmt (Settings.fail_kg s) ^ " " ^ u)
+            ^ "." )
+    | Countdown | Rest ->
+        let line =
+          match (st.phase, last_rep st) with
+          | Rest, Some (r : Rep.t) ->
+              "Rep " ^ string_of_int reps ^ ": "
+              ^ b (Timer_ui.secs1 r.seconds)
+              ^ {js| · median |js}
+              ^ b (fmt ~d:2 r.median_kg)
+              ^ " " ^ u ^ ". "
+              ^ rep_heading ~rep_n ~planned
+              ^ " starts at 0."
+          | _ -> first_rep_line t ~planned
+        in
+        ( "",
+          (if st.phase = Rest then "Rest" else "Get ready"),
+          countdown_text (Session.seconds_left st ~now),
+          "timer count",
+          Session.progress st ~now,
+          "",
+          "dev",
+          line )
+    | Off ->
+        let line =
+          if not live then
+            if E.conn t = E.Connecting then Browser.esc (E.conn_step t)
+            else "Connect your Progressor to start."
+          else if st.handler = Session.Weighing then
+            if st.holding then {js|Weighing the load…|js}
+            else "Load set down. Weight saved under Target."
+          else
+            "Pick the gripper, side and weight, then start a set. (Tare is in \
+             Settings.)"
+        in
+        ("", "", idle_timer t, "timer idle", 0., "", "dev", line)
+  in
+  attr "off" refs.root "data-off" off;
+  text "phase" refs.phase ph;
+  text "timer" refs.timer tm;
+  cls "timerc" refs.timer tm_class;
+  text "dev" refs.dev dev_text;
+  cls "devc" refs.dev dev_class;
+  html "line" refs.statline line;
+  set_progress refs progress;
+  text "rate" refs.rate
+    (match E.hz t with 0 -> "" | hz -> string_of_int hz ^ " Hz");
+  match Browser.ref_canvas refs.graph with
+  | Some cv ->
+      Timer_draw.maybe_read_colors (Browser.canvas_element cv);
+      Timer_draw.live cv s (E.buffer t) ~x1:render_t
+  | None -> ()
+
+(* Manual mode's readout: no force, so the rep's elapsed time is the big number; after rep 1
+   it is shown against rep 1's time, and the bar fills toward it. *)
+let draw_manual (refs : readout_refs) cache (t : E.t) ~now =
+  let st = E.session t in
+  let text key r v = cached cache key r Browser.set_text_content v in
+  let html key r v = cached cache key r Browser.set_inner_html v in
+  let cls key r v = cached cache key r Browser.set_class_name v in
+  let reps = Session.reps_done st in
+  let rep_n = reps + 1 and planned = Session.planned_reps st in
+  let b x = "<b>" ^ x ^ "</b>" in
+  let rep1 =
+    match st.current with
+    | Some { reps = (r : Rep.t) :: _; _ } -> Some r.seconds
+    | _ -> None
+  in
+  let ph, tm, tm_class, progress, dev_text, line =
+    match st.phase with
+    | Session.Rep ->
+        let elapsed = Session.rep_elapsed st ~now in
+        ( rep_heading ~rep_n ~planned,
+          Js.Float.toFixed ~digits:1 elapsed ^ "s",
+          "timer",
+          (match rep1 with
+          | Some g when g > 0. -> Float.min 1. (elapsed /. g)
+          | _ -> 0.),
+          (match rep1 with
+          | Some h -> "rep 1: " ^ Timer_ui.secs1 h
+          | None -> ""),
+          "Tap " ^ b "End rep" ^ " when you let go." )
+    | Countdown | Rest ->
+        ( (if st.phase = Rest then "Rest" else "Get ready"),
+          countdown_text (Session.seconds_left st ~now),
+          "timer count",
+          Session.progress st ~now,
+          "",
+          match (st.phase, last_rep st) with
+          | Rest, Some (r : Rep.t) ->
+              "Rep " ^ string_of_int reps ^ ": "
+              ^ b (Timer_ui.secs1 r.seconds)
+              ^ ". "
+              ^ rep_heading ~rep_n ~planned
+              ^ " starts at 0."
+          | _ -> first_rep_line t ~planned )
+    | Off ->
+        ( "Manual mode",
+          idle_timer t,
+          "timer idle",
+          0.,
+          "",
+          "No Progressor needed: start a set, then tap " ^ b "End rep"
+          ^ " to end each rep." )
+  in
+  text "phase" refs.phase ph;
+  text "timer" refs.timer tm;
+  cls "timerc" refs.timer tm_class;
+  cached cache "off" refs.root
+    (fun el v -> Browser.set_attribute el "data-off" v)
+    "";
+  text "dev" refs.dev dev_text;
+  cls "devc" refs.dev "dev target";
+  html "line" refs.statline line;
+  set_progress refs progress;
+  text "rate" refs.rate ""
+
+let draw_frame (refs : readout_refs) cache (t : E.t) ~render_t ~now =
+  if E.manual t then draw_manual refs cache t ~now
+  else draw_frame_force refs cache t ~render_t ~now
+
+(* --- status line (the MVP's renderStatus) --- *)
+
+let status (t : E.t) =
+  let st = E.session t in
+  let in_set =
+    match st.phase with
+    | Session.Countdown -> Some ("wait", "Get ready")
+    | Rest -> Some ("wait", "Rest")
+    | Rep ->
+        Some
+          ( "grip",
+            "Rep "
+            ^ string_of_int (Session.reps_done st + 1)
+            ^ "/"
+            ^ string_of_int (Session.planned_reps st) )
+    | Off -> None
+  in
+  (* manual mode: never connected, and nothing to connect *)
+  if E.manual t then Option.value in_set ~default:("live", "Ready")
+  else
+    match (E.conn t, in_set) with
+    | E.Connecting, _ -> ("wait", "Connecting")
+    | Reconnecting, _ -> ("wait", "Reconnecting")
+    | Off, _ -> ("off", "Not connected")
+    | Live, Some shown -> shown
+    | Live, None ->
+        if st.handler = Session.Weighing then ("grip", "Weighing")
+        else ("live", "Connected")
+
+(* --- panels --- *)
+
+module Target_panel = struct
+  let[@react.component] make ~(t : E.t) () =
+    let s = E.settings t and st = E.session t in
+    let locked = E.in_set t in
+    let u = Settings.unit_label s in
+    let measured = st.measured in
+    <section className="panel" id="tm-target">
+      <h2>(React.string "Target")</h2>
+      <div className="row">
+        <Timer_parts.Seg
+          id="tm-gripper"
+          className="seg wide"
+          label="Gripper"
+          items=Grippers.all
+          pressed=s.gripper
+          on_pick=(fun gripper -> E.pick_hand t ~gripper ~side:s.side)
+          disabled=locked
+        />
+        <Timer_parts.Seg
+          id="tm-side"
+          className="seg wide"
+          label="Side"
+          items=(List.map (fun sd -> (sd, Jsnum.capitalize sd)) Grippers.sides)
+          pressed=s.side
+          on_pick=(fun side -> E.pick_hand t ~gripper:s.gripper ~side)
+          disabled=locked
+        />
+      </div>
+      <div className="target-row">
+        <div className="stepper">
+          <button
+            type_="button"
+            id="tMinus"
+            ariaLabel="Decrease target"
+            disabled=locked
+            onClick=(fun _ ->
+                      E.set_target t (Settings.step_target s (-1)).target)>
+            (React.string {js|−|js})
+          </button>
+          <Timer_parts.Num_field
+            id="targetInput"
+            className=""
+            value=(Timer_ui.disp1 s s.target)
+            min="0"
+            max=""
+            step=(Settings.target_step s)
+            inputMode="decimal"
+            label="Target weight"
+            disabled=locked
+            on_commit=(fun v ->
+                          match Timer_parts.parse_float v with
+                          | Some x -> (
+                              match Settings.set_target_display s x with
+                              | Some s' -> E.set_target t s'.target
+                              | None -> ())
+                          | None -> ())
+          />
+          <button
+            type_="button"
+            id="tPlus"
+            ariaLabel="Increase target"
+            disabled=locked
+            onClick=(fun _ -> E.set_target t (Settings.step_target s 1).target)>
+            (React.string "+")
+          </button>
+        </div>
+        <span className="label" id="targetUnit">(React.string u)</span>
+        <span className="reps-pick">
+          <span className="label">(React.string "Reps")</span>
+          <span className="stepper narrow">
+            <button
+              type_="button"
+              id="rMinus"
+              ariaLabel="Fewer reps"
+              disabled=locked
+              onClick=(fun _ ->
+                        E.set_planned_reps t (float_of_int (s.planned_reps - 1)))>
+              (React.string {js|−|js})
+            </button>
+            <Timer_parts.Num_field
+              id="repsInput"
+              className=""
+              value=(string_of_int s.planned_reps)
+              min="1"
+              max="20"
+              step=1.
+              inputMode="numeric"
+              label="Reps in the set"
+              disabled=locked
+              on_commit=(fun v ->
+                            match Timer_parts.parse_float v with
+                            | Some x when x >= 1. -> E.set_planned_reps t x
+                            | _ -> ())
+            />
+            <button
+              type_="button"
+              id="rPlus"
+              ariaLabel="More reps"
+              disabled=locked
+              onClick=(fun _ ->
+                        E.set_planned_reps t (float_of_int (s.planned_reps + 1)))>
+              (React.string "+")
+            </button>
+          </span>
+        </span>
+      </div>
+      (if locked || E.manual t then React.null
+       else
+         <div className="measure-box">
+           <div>
+             <div className="label">(React.string "Measured load")</div>
+             <div className="measure-val" id="measureVal">
+               (React.string
+                  (match measured with
+                  | Some m -> Settings.format ~digits:1 s m ^ " " ^ u
+                  | None -> {js|—|js}))
+             </div>
+           </div>
+           <button
+             className="btn"
+             id="useMeasured"
+             type_="button"
+             disabled=(measured = None || st.holding)
+             onClick=(fun _ ->
+                       match measured with
+                       | Some m -> E.set_target t m
+                       | None -> ())>
+             (React.string "Use as target")
+           </button>
+         </div>)
+    </section>
+end
+
+module Set_panel = struct
+  let[@react.component] make ~(t : E.t) () =
+    match (E.session t).current with
+    | None -> React.null
+    | Some c ->
+        let s = E.settings t in
+        <section className="panel" id="setPanel">
+          <h2>
+            (React.string
+               ({js|This set · |js} ^ E.gripper_name c.gripper ^ " "
+              ^ Timer_ui.side_label c.side ^ {js| · |js}
+               ^ Settings.format s c.target_kg
+               ^ " " ^ Settings.unit_label s))
+          </h2>
+          (if c.reps = [] then React.null
+           else if E.set_is_manual t then
+             <Timer_parts.Manual_summary id="summary" set=c />
+           else <Timer_parts.Summary_cells id="summary" settings=s set=c />)
+          (if E.set_is_manual t then <Timer_parts.Hold_list id="reps" set=c />
+           else <Timer_parts.Rep_list id="reps" settings=s set=c wide=false />)
+          (if c.reps = [] then
+             <p className="empty">
+               (React.string "Reps appear here as you finish them.")
+             </p>
+           else React.null)
+        </section>
+end
+
+(* The end-of-set review: save (with a corrected weight) or discard. *)
+module Review = struct
+  let[@react.component] make ~(t : E.t) ~(r : E.review) () =
+    let s = E.settings t in
+    let u = Settings.unit_label s in
+    let set = r.set in
+    let n = List.length set.reps in
+    let save_ref = React.useRef Js.Nullable.null in
+    React.useEffect0 (fun () ->
+        Option.iter Browser.focus (Browser.ref_el save_ref);
+        None);
+    let changed = Float.abs (r.kg -. set.target_kg) > 1e-6 in
+    let rep1 = match set.reps with r :: _ -> Some r.seconds | [] -> None in
+    let actual = Option.bind rep1 Set_types.classify in
+    let will_upload = s.pc_auto && E.pc_valid t in
+    let manual = r.manual in
+    <div className="scrim" id="reviewScrim">
+      <div
+        className="sheet"
+        role="dialog"
+        ariaModal=true
+        ariaLabelledby="reviewTitle">
+        <div>
+          <div className="label">(React.string "Set finished")</div>
+          <h2 id="reviewTitle">
+            (React.string
+               (E.gripper_name set.gripper ^ {js| · |js}
+               ^ Timer_ui.side_label set.side
+               ^ {js| · |js} ^ Timer_ui.plural n "rep"))
+          </h2>
+          <p className="meta" id="reviewReps">
+            (React.string
+               ("Reps: "
+               ^ String.concat ", "
+                   (List.map
+                      (fun (r : Rep.t) -> Timer_ui.secs1 r.seconds)
+                      set.reps)))
+          </p>
+        </div>
+        (if manual then
+           <>
+             <Timer_parts.Manual_summary id="reviewSummary" set />
+             <p className="hint" id="reviewManual">
+               (React.string
+                  "Manual set: the hold times you tapped, at the weight below. \
+                   No force was measured, so none is saved.")
+             </p>
+           </>
+         else <Timer_parts.Summary_cells id="reviewSummary" settings=s set />)
+        <div className="target-row">
+          <span className="label">(React.string "Logged weight")</span>
+          <div className="stepper">
+            <button
+              type_="button"
+              id="reviewMinus"
+              ariaLabel="Decrease logged weight"
+              disabled=false
+              onClick=(fun _ -> E.review_nudge t (-1))>
+              (React.string {js|−|js})
+            </button>
+            <Timer_parts.Num_field
+              id="reviewInput"
+              className=""
+              value=(Timer_ui.disp1 s r.kg)
+              min="0"
+              max=""
+              step=(E.review_step t)
+              inputMode="decimal"
+              label="Logged weight"
+              disabled=false
+              on_commit=(fun v ->
+                            match Timer_parts.parse_float v with
+                            | Some x when x > 0. ->
+                                E.review_set_kg t (Settings.of_display s x)
+                            | _ -> ())
+            />
+            <button
+              type_="button"
+              id="reviewPlus"
+              ariaLabel="Increase logged weight"
+              disabled=false
+              onClick=(fun _ -> E.review_nudge t 1)>
+              (React.string "+")
+            </button>
+          </div>
+          <span className="label" id="reviewUnit">(React.string u)</span>
+        </div>
+        <p className="hint" id="reviewNote">
+          (React.string
+             (if changed then
+                "Will be logged as " ^ Timer_ui.disp1 s r.kg ^ " " ^ u
+                ^ " instead of "
+                ^ Timer_ui.disp1 s set.target_kg
+                ^ " " ^ u ^ "."
+              else ""))
+        </p>
+        <p className="hint" id="reviewType">
+          (React.string
+             (match (rep1, actual) with
+             | Some h, Some ty ->
+                 "Rep 1 held " ^ Timer_ui.secs1 h ^ ": " ^ Set_types.label ty
+                 ^ "."
+             | Some _, None | None, _ -> ""))
+        </p>
+        <div className="row">
+          <button
+            className="btn primary grow"
+            id="reviewSave"
+            type_="button"
+            ref=(ReactDOM.Ref.domRef save_ref)
+            onClick=(fun _ -> E.review_save t)>
+            (React.string (if will_upload then "Save and upload" else "Save"))
+          </button>
+          <button
+            className="btn danger"
+            id="reviewDiscard"
+            type_="button"
+            onClick=(fun _ -> E.review_discard t)>
+            (React.string
+               (if r.discard_armed then "Click again to discard" else "Discard"))
+          </button>
+        </div>
+      </div>
+    </div>
+end
+
+module Error_box = struct
+  let[@react.component] make ~(e : E.notice) () =
+    <div className="notice err" id="errorBox">
+      (React.string e.lead)
+      (match e.code with
+      | Some c -> <>(React.string " ") <code>(React.string c)</code></>
+      | None -> React.null)
+      (e.lines
+      |> List.mapi (fun i l ->
+          <React.Fragment key=(string_of_int i)>
+            <br /> (React.string l)
+          </React.Fragment>)
+      |> Array.of_list |> React.array)
+    </div>
+end
+
+let[@react.component] make () =
+  let t = E.get () in
+  let _, force = React.useReducer (fun n () -> n + 1) 0 in
+  React.useEffect0 (fun () -> Some (E.subscribe t (fun () -> force ())));
+  let s = E.settings t in
+  (* A stored gripper or side that isn't one of the listed ones falls back to the first. *)
+  React.useLayoutEffect1
+    (fun () ->
+      let gripper =
+        if List.mem_assoc s.gripper Grippers.all then s.gripper
+        else fst (List.hd Grippers.all)
+      and side =
+        if List.mem s.side Grippers.sides then s.side
+        else List.hd Grippers.sides
+      in
+      if gripper <> s.gripper || side <> s.side then
+        E.pick_hand t ~gripper ~side;
+      None)
+    [| s.gripper ^ "/" ^ s.side |];
+  (* The per-frame readout and graph. *)
+  let refs =
+    {
+      root = React.useRef Js.Nullable.null;
+      force_num = React.useRef Js.Nullable.null;
+      force_unit = React.useRef Js.Nullable.null;
+      phase = React.useRef Js.Nullable.null;
+      timer = React.useRef Js.Nullable.null;
+      dev = React.useRef Js.Nullable.null;
+      statline = React.useRef Js.Nullable.null;
+      progress = React.useRef Js.Nullable.null;
+      graph = React.useRef Js.Nullable.null;
+      rate = React.useRef Js.Nullable.null;
+    }
+  in
+  React.useEffect0 (fun () ->
+      let cache = Js.Dict.empty () in
+      E.attach_view t (fun t ~render_t ~now ->
+          draw_frame refs cache t ~render_t ~now);
+      Some (fun () -> E.detach_view t));
+  (* A sheet locks the page behind it; Escape closes the set sheet. *)
+  let sheet_open = E.review t <> None || E.sheet t <> None in
+  React.useEffect1
+    (fun () ->
+      let body = Browser.body Browser.document in
+      if sheet_open then Browser.class_list_add body "locked"
+      else Browser.class_list_remove body "locked";
+      Some (fun () -> Browser.class_list_remove body "locked"))
+    [| sheet_open |];
+  React.useEffect0 (fun () ->
+      let on_key e =
+        if
+          Browser.undef_str (Browser.event_key e) = "Escape"
+          && E.sheet t <> None
+        then E.close_sheet t
+      in
+      Browser.add_doc_listener Browser.document "keydown" on_key false;
+      Some
+        (fun () ->
+          Browser.remove_doc_listener Browser.document "keydown" on_key false));
+  let in_set = E.in_set t in
+  let manual = E.manual t in
+  let pill_s, pill_text = status t in
+  let conn_label =
+    match E.conn t with
+    | E.Live | Reconnecting -> "Disconnect"
+    | Connecting -> "Cancel"
+    | Off -> "Connect Progressor"
+  in
+  <div className="timer-tab">
+    <div className="tm-bar">
+      <span className=("pill " ^ pill_s) id="statusPill">
+        (React.string pill_text)
+      </span>
+      (* Manual mode: time reps by hand, no Progressor. Locked during a set, like the other
+         settings that shape it. *)
+      <label
+        className="toggle manual-toggle"
+        title=(if in_set then "Locked while a set is in progress"
+               else "Time reps by hand, without the Progressor")>
+        <input
+          type_="checkbox"
+          id="manualMode"
+          checked=manual
+          disabled=in_set
+          onChange=(fun e -> E.set_manual t (Browser.target_checked e))
+        />
+        (React.string "Manual")
+      </label>
+      <div className="hdr-meta num">
+        <span id="rate" ref=(ReactDOM.Ref.domRef refs.rate) />
+        <span id="battery">
+          (React.string
+             (match E.battery t with
+             | Some b when E.streaming t -> string_of_int b ^ "% battery"
+             | _ -> ""))
+        </span>
+      </div>
+    </div>
+    <section
+      className=(if manual then "tm-readout manual" else "tm-readout")
+      id="readout"
+      ref=(ReactDOM.Ref.domRef refs.root)>
+      <div className="force" id="force">
+        <span ref=(ReactDOM.Ref.domRef refs.force_num) id="forceNum">
+          (React.string "0.0")
+        </span>
+        <span
+          className="unit"
+          id="forceUnit"
+          ref=(ReactDOM.Ref.domRef refs.force_unit)>
+          (React.string (Settings.unit_label s))
+        </span>
+      </div>
+      <div className="side">
+        <div
+          className="phase" id="phase" ref=(ReactDOM.Ref.domRef refs.phase)
+        />
+        <div
+          className="timer idle" id="timer" ref=(ReactDOM.Ref.domRef refs.timer)>
+          (React.string "0.0s")
+        </div>
+        <div className="dev" id="dev" ref=(ReactDOM.Ref.domRef refs.dev) />
+      </div>
+      <div
+        className="statline"
+        id="statline"
+        ref=(ReactDOM.Ref.domRef refs.statline)
+      />
+      <div
+        className="progress"
+        id="progress"
+        ref=(ReactDOM.Ref.domRef refs.progress)
+      />
+    </section>
+    (* Manual mode: no force, so no graph (kept mounted, hidden, so the frame loop's canvas
+       and the window setting stay as they are). *)
+    <section className="graph-wrap" ariaLabel="Live force graph" hidden=manual>
+      <canvas id="graph" ref=(ReactDOM.Ref.domRef refs.graph) />
+      <div className="graph-bar">
+        <span className="label">(React.string "Window")</span>
+        <Timer_parts.Seg
+          id="windowSeg"
+          className="seg"
+          label="Graph window"
+          items=(List.map
+                   (fun w -> (string_of_int w, string_of_int w ^ "s"))
+                   Settings.windows)
+          pressed=(string_of_int s.window_s)
+          on_pick=(fun w ->
+                    E.change t
+                      { (E.settings t) with window_s = int_of_string w })
+          disabled=false
+        />
+      </div>
+    </section>
+    (* Shown for the whole set (enabled only during a rep) so that nothing below it moves when a
+       rep starts or ends; set apart from "End set early" by its colour and a wider gap. *)
+    (if in_set then
+       <button
+         className=("btn big primary end-rep" ^ if manual then " manual" else "")
+         id="endRepBtn"
+         type_="button"
+         title="End this rep now and keep it"
+         disabled=((E.session t).phase <> Session.Rep)
+         onClick=(fun _ -> E.end_rep t)>
+         (React.string "End rep")
+       </button>
+     else React.null)
+    <button
+      className=("btn big " ^ if in_set then "danger" else "primary")
+      id="setBtn"
+      type_="button"
+      disabled=((not in_set) && not (manual || E.streaming t))
+      onClick=(fun _ -> if in_set then E.end_set t else E.start_set t)>
+      (React.string (if in_set then "End set early" else "Start set"))
+    </button>
+    <div className="row" hidden=manual>
+      <button
+        className=("btn grow" ^ if E.conn t = E.Off then " primary" else "")
+        id="connectBtn"
+        type_="button"
+        disabled=in_set
+        onClick=(fun _ ->
+                  if E.conn t = E.Off then E.connect t ~accept_all:false
+                  else ignore (E.disconnect t))>
+        (React.string conn_label)
+      </button>
+      <button
+        className="btn"
+        id="powerOffBtn"
+        type_="button"
+        title="Turn off the Progressor"
+        disabled=(E.conn t <> E.Live || in_set)
+        onClick=(fun _ -> E.power_off t)>
+        (React.string "Turn off")
+      </button>
+    </div>
+    <div className="row" hidden=manual>
+      <button
+        className="linkish"
+        id="allDevicesBtn"
+        type_="button"
+        onClick=(fun _ -> E.connect t ~accept_all:true)>
+        (React.string "Can't see it? Show all Bluetooth devices")
+      </button>
+    </div>
+    (match E.error t with Some e -> <Error_box e /> | None -> React.null)
+    <Target_panel t />
+    <Set_panel t />
+    <Timer_history t />
+    <Timer_settings t />
+    (match E.review t with Some r -> <Review t r /> | None -> React.null)
+    (match E.sheet t with
+    | Some sh -> <Timer_history.Sheet t sh />
+    | None -> React.null)
+    (match E.current_toast t with
+    | Some m -> <div className="toast" id="toast">(React.string m)</div>
+    | None -> React.null)
+  </div>

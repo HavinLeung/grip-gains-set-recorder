@@ -1,0 +1,20 @@
+{
+  "name": "grip-gains-set-recorder",
+  "private": true,
+  "license": "MIT",
+  "type": "module",
+  "description": "Grip Gains Set Recorder: a set timer for the Tindeq Progressor (Web Bluetooth). Melange + reason-react + mlx, served as static files.",
+  "scripts": {
+    "build": "opam exec -- dune build @web && node scripts/bundle-web.mjs",
+    "serve": "node scripts/serve.mjs",
+    "test": "opam exec -- dune test && opam exec -- dune build @web && node --test tests/unit/",
+    "publish": "npm run build && node scripts/publish.mjs"
+  },
+  "dependencies": {
+    "react": "19.3.1",
+    "react-dom": "19.3.1"
+  },
+  "devDependencies": {
+    "esbuild": "0.28.2"
+  }
+}

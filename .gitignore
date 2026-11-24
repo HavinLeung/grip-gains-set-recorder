@@ -1,0 +1,6 @@
+# opam local switch, dune and npm output, the built site
+_opam/
+_build/
+node_modules/
+dist/
+.DS_Store
